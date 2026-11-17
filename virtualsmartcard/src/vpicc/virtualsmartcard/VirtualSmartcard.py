@@ -20,9 +20,11 @@
 import atexit
 import errno
 import logging
+import select
 import socket
 import struct
 import sys
+import threading
 from virtualsmartcard.ConstantDefinitions import MAX_EXTENDED_LE, MAX_SHORT_LE
 from virtualsmartcard.SWutils import SwError, SW
 from virtualsmartcard.SmartcardFilesystem import make_property
@@ -63,7 +65,21 @@ class Iso7816OS(SmartcardOS):
 
     def __init__(self, mf, sam, ins2handler=None, extended_length=False):
         self.mf = mf
-        self.SAM = sam
+
+        if sam is None:
+            # Allow Iso7816OS construction without a SAM.  The resulting card
+            # won't support security-oriented APDUs (0x2a, 0x20, 0x22, 0x24,
+            # 0x46, 0x82, 0x84, 0x88), but plain SELECT / READ / WRITE / CREATE
+            # on the filesystem works fine.  Useful for tests and for simple
+            # cards that have no cryptographic module.
+            class _DummySAM:
+                def __getattr__(self, _name):
+                    def _(*_a, **_kw):
+                        raise SwError(SW["ERR_NOTSUPPORTED"])
+                    return _
+            self.SAM = _DummySAM()
+        else:
+            self.SAM = sam
 
         if not ins2handler:
             self.ins2handler = {
@@ -246,7 +262,11 @@ class Iso7816OS(SmartcardOS):
                 self.lastCommandSW = sw
                 sw = SW["NORMAL_REST"] + min(0xff, l)
         else:
-            if le > len(data):
+            # seekable commands (READ/WRITE/SEARCH/UPDATE) may arrive without
+            # an explicit Le byte; default to the full data length so the
+            # boundary check still makes sense.
+            effective_le = le if le is not None else len(data)
+            if effective_le > len(data):
                 sw = SW["WARN_EOFBEFORENEREAD"]
 
         if le is not None:
@@ -427,7 +447,7 @@ class VirtualICC(object):
                  readernum=None, mitmPath=None, ef_cardsecurity=None, ef_cardaccess=None,
                  ca_key=None, cvca=None, disable_checks=False, esign_key=None,
                  esign_ca_cert=None, esign_cert=None,
-                 logginglevel=logging.INFO):
+                 logginglevel=logging.INFO, multi_interface=False):
         from os.path import exists
 
         logging.basicConfig(level=logginglevel,
@@ -473,14 +493,26 @@ class VirtualICC(object):
             self.os = Iso7816OS(MF, SAM)
         self.type = card_type
 
+        # Mutex serializing access to the single card OS across all interfaces.
+        # This mimics a real card's internal arbitrator: multiple interfaces
+        # (7816, 14443, ...) can arrive concurrently, but only one can
+        # execute at a time.
+        self.card_lock = threading.Lock()
+
+        # True = multiple TCP connections share one card object (一卡多接口)
+        # False = original single-connection behavior (一socket一卡)
+        self.multi_interface = multi_interface
+
         # Connect to the VPCD
         self.host = host
         self.port = port
+        self.connections = []
         if host:
-            # use normal connection mode
+            # use normal connection mode: vpicc主动连vpcd，保持单连接
             try:
                 self.sock = self.connectToPort(host, port)
                 self.sock.settimeout(None)
+                self.connections = [self.sock]
                 self.server_sock = None
             except socket.error as e:
                 logging.critical("Failed to open socket: %s", str(e))
@@ -488,30 +520,49 @@ class VirtualICC(object):
                               firewall blocking port %u?", host, port)
                 sys.exit()
         else:
-            # use reversed connection mode
-            try:
-                local_ip = [(s.connect(('9.9.9.9', 53)), s.getsockname()[0], s.close()) for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]
-                custom_url = 'vicc://%s:%d' % (local_ip, port)
-                print('VICC hostname:  %s' % local_ip)
-                print('VICC port:      %d' % port)
-                print('On your NFC phone with the Android Smart Card Emulator app scan this code:')
+            # reversed connection mode: vpcd连vpicc的server_sock
+            if multi_interface:
+                # multi-interface 模式：只 bind+listen，不 accept 任何连接。
+                # accept 会在 _runMulti() 的 select 循环里完成，从而支持
+                # 多个 TCP 连接同时到达。
+                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                server_socket.bind(('', port))
+                server_socket.listen(0)
+                server_socket.settimeout(None)
+                self.server_sock = server_socket
+                self.sock = None
+                self.connections = []
+                print(f"VICC multi-interface server listening on port {port}")
+            else:
+                # original single-connection reversed mode: openPort() 会立即
+                # 阻塞 accept() 等第一个连接到达
                 try:
-                    import qrcode
-                    qr = qrcode.QRCode()
-                    qr.add_data(custom_url)
-                    qr.print_ascii()
-                except ImportError:
-                    print('https://api.qrserver.com/v1/create-qr-code/?data=%s' % custom_url)
-                (self.sock, self.server_sock, host) = self.openPort(port)
-                self.sock.settimeout(None)
-            except socket.error as e:
-                logging.critical("Failed to open socket: %s", str(e))
-                logging.critical("Is pcscd running? Is vpcd loaded and in \
-                              reversed connection mode? Is a firewall \
-                              blocking port %u?", port)
-                sys.exit()
+                    local_ip = [(s.connect(('9.9.9.9', 53)), s.getsockname()[0], s.close()) for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]
+                    custom_url = 'vicc://%s:%d' % (local_ip, port)
+                    print('VICC hostname:  %s' % local_ip)
+                    print('VICC port:      %d' % port)
+                    print('On your NFC phone with the Android Smart Card Emulator app scan this code:')
+                    try:
+                        import qrcode
+                        qr = qrcode.QRCode()
+                        qr.add_data(custom_url)
+                        qr.print_ascii()
+                    except ImportError:
+                        print('https://api.qrserver.com/v1/create-qr-code/?data=%s' % custom_url)
+                    (self.sock, self.server_sock, host) = self.openPort(port)
+                    self.sock.settimeout(None)
+                    self.connections = [self.sock]
+                except socket.error as e:
+                    logging.critical("Failed to open socket: %s", str(e))
+                    logging.critical("Is pcscd running? Is vpcd loaded and in \
+                                  reversed connection mode? Is a firewall \
+                                  blocking port %u?", port)
+                    sys.exit()
 
-        logging.info("Connected to virtual PCD at %s:%u", host, port)
+        logging.info("Connected to virtual PCD at %s:%u (multi_interface=%s)",
+                     host, port, multi_interface)
 
         atexit.register(self.stop)
 
@@ -535,51 +586,156 @@ class VirtualICC(object):
         (client_socket, address) = server_socket.accept()
         return (client_socket, server_socket, address[0])
 
-    def __sendToVPICC(self, msg):
-        """ Send a message to the vpcd """
+    def __sendToVPICC(self, msg, sock=None):
+        """ Send a message to the vpcd.  Defaults to self.sock. """
+        if sock is None:
+            sock = self.sock
         if isinstance(msg, str):
-            self.sock.sendall(struct.pack('!H', len(msg)) + bytes(map(ord,msg)))
+            sock.sendall(struct.pack('!H', len(msg)) + bytes(map(ord,msg)))
         else:
-            self.sock.sendall(struct.pack('!H', len(msg)) + msg)
+            sock.sendall(struct.pack('!H', len(msg)) + msg)
 
-    def __recvFromVPICC(self):
-        """ Receive a message from the vpcd """
-        # receive message size
-        while True:
+    def __recvFromVPICC(self, sock=None):
+        """ Receive a message from the vpcd on ``sock`` (default self.sock). """
+        if sock is None:
+            sock = self.sock
+        # receive message size (2 bytes).  Loop until full — on Windows
+        # recv(2) may return only 1 byte (TCP streams have no record
+        # boundaries), which would corrupt the protocol framing.
+        sizestr = b''
+        while len(sizestr) < _Csizeof_short:
             try:
-                sizestr = self.sock.recv(_Csizeof_short)
+                chunk = sock.recv(_Csizeof_short - len(sizestr))
             except socket.error as e:
                 if e.errno == errno.EINTR:
                     continue
-            break
-        if len(sizestr) == 0:
-            logging.info("Virtual PCD shut down")
-            raise socket.error
+                raise
+            if not chunk:
+                logging.info("Virtual PCD shut down on %s", sock.getpeername() if sock else "?")
+                raise socket.error("peer closed")
+            sizestr += chunk
         size = struct.unpack('!H', sizestr)[0]
 
         # receive and return message
-        if size:
-            while True:
-                try:
-                    msg = self.sock.recv(size)
-                except socket.error as e:
-                    if e.errno == errno.EINTR:
-                        continue
-                break
-            if len(msg) == 0:
-                logging.info("Virtual PCD shut down")
-                raise socket.error
-        else:
-            msg = None
+        msg = b''
+        while len(msg) < size:
+            try:
+                chunk = sock.recv(size - len(msg))
+            except socket.error as e:
+                if e.errno == errno.EINTR:
+                    continue
+                raise
+            if not chunk:
+                logging.info("Virtual PCD shut down on %s", sock.getpeername() if sock else "?")
+                raise socket.error("peer closed")
+            msg += chunk
 
         return size, msg
+
+    def _handleMessage(self, sock, size, msg):
+        """ Dispatch one C-APDU / control command and send response back.
+
+        Threading model: 必须在持有 self.card_lock 的外部调用里执行。
+        """
+        if not size:
+            logging.warning("Error in communication protocol (missing size parameter)")
+            return
+        elif size == VPCD_CTRL_LEN:
+            if msg == inttostring(VPCD_CTRL_OFF):
+                logging.info("Power Down")
+                self.os.powerDown()
+            elif msg == inttostring(VPCD_CTRL_ON):
+                logging.info("Power Up")
+                self.os.powerUp()
+            elif msg == inttostring(VPCD_CTRL_RESET):
+                logging.info("Reset")
+                self.os.reset()
+            elif msg == inttostring(VPCD_CTRL_ATR):
+                self.__sendToVPICC(self.os.getATR(), sock)
+            else:
+                logging.warning("unknown control command")
+        else:
+            if size != len(msg):
+                logging.warning("Expected %u bytes, but received only %u",
+                                size, len(msg))
+
+            logging.info("Command APDU (%d bytes):\n  %s", len(msg),
+                    hexdump(msg, indent=2))
+            proprietary = False
+            try:
+                parsed = C_APDU(msg)
+                logging.debug(str(parsed))
+                if parsed.CLA & 0b10000000 == 0b10000000:
+                    proprietary = True
+            except:
+                proprietary = True
+
+            answer = self.os.execute(msg)
+
+            try:
+                if not proprietary:
+                    logging.debug(str(R_APDU(answer)))
+            except:
+                pass
+            logging.info("Response APDU (%d bytes):\n  %s", len(answer),
+                    hexdump(answer, indent=2))
+
+            self.__sendToVPICC(answer, sock)
+
+    def _runMulti(self):
+        """ Multi-interface run loop: one card OS, many TCP connections.
+
+        Uses select() to watch server_sock (for new connections) and all
+        existing connection sockets.  Each APDU dispatches through the
+        shared card OS, protected by self.card_lock to serialize access.
+        """
+        while True:
+            rlist = [self.server_sock] + self.connections
+            try:
+                readable, _, _ = select.select(rlist, [], [])
+            except (ValueError, select.error):
+                # socket 列表变了（例如全断了），重试
+                continue
+
+            for s in readable:
+                if s is self.server_sock:
+                    # accept 新连接
+                    try:
+                        new_conn, _ = self.server_sock.accept()
+                        new_conn.settimeout(None)
+                        self.connections.append(new_conn)
+                        logging.info("New vpicc connection from %s (total=%d)",
+                                     new_conn.getpeername(), len(self.connections))
+                    except socket.error as e:
+                        logging.warning("accept failed: %s", str(e))
+                else:
+                    # 从已有连接读
+                    try:
+                        size, msg = self.__recvFromVPICC(s)
+                    except socket.error:
+                        logging.info("vpicc connection closed on %s",
+                                     s.getpeername() if s else "?")
+                        self.connections.remove(s)
+                        try: s.close()
+                        except: pass
+                        continue
+                    with self.card_lock:
+                        self._handleMessage(s, size, msg)
 
     def run(self):
         """
         Main loop of the vpicc. Receives command APDUs via a socket from the
         vpcd, dispatches them to the emulated smartcard and sends the resulting
-        respsonse APDU back to the vpcd.
+        response APDU back to the vpcd.
+
+        multi_interface=True 时支持多 TCP 连接并发（一卡多接口）。
         """
+        if self.multi_interface:
+            logging.info("Starting in multi-interface mode (一卡多接口)")
+            self._runMulti()
+            return
+
+        # original single-connection behavior
         while True:
             try:
                 (size, msg) = self.__recvFromVPICC()
@@ -592,52 +748,14 @@ class VirtualICC(object):
                     logging.critical(str(e))
                     sys.exit()
 
-            if not size:
-                logging.warning("Error in communication protocol (missing \
-                                size parameter)")
-            elif size == VPCD_CTRL_LEN:
-                if msg == inttostring(VPCD_CTRL_OFF):
-                    logging.info("Power Down")
-                    self.os.powerDown()
-                elif msg == inttostring(VPCD_CTRL_ON):
-                    logging.info("Power Up")
-                    self.os.powerUp()
-                elif msg == inttostring(VPCD_CTRL_RESET):
-                    logging.info("Reset")
-                    self.os.reset()
-                elif msg == inttostring(VPCD_CTRL_ATR):
-                    self.__sendToVPICC(self.os.getATR())
-                else:
-                    logging.warning("unknown control command")
-            else:
-                if size != len(msg):
-                    logging.warning("Expected %u bytes, but received only %u",
-                                    size, len(msg))
-
-                logging.info("Command APDU (%d bytes):\n  %s", len(msg),
-                        hexdump(msg, indent=2))
-                proprietary = False
-                try:
-                    parsed = C_APDU(msg)
-                    logging.debug(str(parsed))
-                    if parsed.CLA & 0b10000000 == 0b10000000:
-                        proprietary = True
-                except:
-                    proprietary = True
-
-                answer = self.os.execute(msg)
-
-                try:
-                    if not proprietary:
-                        logging.debug(str(R_APDU(answer)))
-                except:
-                    pass
-                logging.info("Response APDU (%d bytes):\n  %s", len(answer),
-                        hexdump(answer, indent=2))
-
-                self.__sendToVPICC(answer)
+            with self.card_lock:
+                self._handleMessage(self.sock, size, msg)
 
     def stop(self):
-        self.sock.close()
+        for s in list(self.connections):
+            try: s.close()
+            except: pass
+        self.connections = []
         if self.server_sock:
-            self.server_sock.close()
+            try: self.server_sock.close()
+            except: pass

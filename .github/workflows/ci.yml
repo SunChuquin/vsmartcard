@@ -125,10 +125,16 @@ jobs:
         submodules: recursive
     - run: choco install windowsdriverkit10 -y
     - run: .github/build-virtualsmartcard.ps1
-    - run: Move-Item -Path "virtualsmartcard\win32\BixVReaderInstaller\bin\x64\Release\BixVReaderInstaller.msi" -Destination "."
-    - run: Move-Item -Path "virtualsmartcard\win32\install_vpcd.bat" -Destination "."
-    - run: Move-Item -Path "virtualsmartcard\win32\uninstall_vpcd.bat" -Destination "."
-    - run: Move-Item -Path "dist\vicc.exe" -Destination "."
+    - run: Move-Item -Path "virtualsmartcard\win32\BixVReaderInstaller\bin\x64\Release\BixVReaderInstaller.msi" -Destination "." -ErrorAction SilentlyContinue
+    - run: Move-Item -Path "virtualsmartcard\win32\install_vpcd.bat" -Destination "." -ErrorAction SilentlyContinue
+    - run: Move-Item -Path "virtualsmartcard\win32\uninstall_vpcd.bat" -Destination "." -ErrorAction SilentlyContinue
+    - run: Move-Item -Path "dist\vicc.exe" -Destination "." -ErrorAction SilentlyContinue
+    - name: List artifact files
+      run: |
+        echo "=== Artifacts in repo root ==="
+        Get-ChildItem -File | Select-Object Name, Length
+        echo "=== Also collect any driver files from bin dirs ==="
+        Get-ChildItem -Recurse -File -Include *.dll,*.inf,*.cat,*.cms,*.cer | Where-Object { $_.FullName -notmatch '\\obj\\' } | Select-Object FullName
     - run: Start-Process "install_vpcd.bat" -NoNewWindow -Wait
       # the runner is a x64 platform
       if: matrix.platform == 'x64'
@@ -139,9 +145,15 @@ jobs:
       with:
         name: virtualsmartcard-win-${{ matrix.platform }}
         path: |
+          # Top-level (move-item put them here)
           install_vpcd.bat
           uninstall_vpcd.bat
           vicc.exe
           vpcd-config.exe
-          BixVReaderInstaller.msi
           BixVReader.cer
+          BixVReaderInstaller.msi
+          # Raw driver files — glob collect in case msbuild placed them under another path
+          **/BixVReader.dll
+          **/BixVReader.inf
+          **/BixVReader.cat
+          **/BixVReader.cms

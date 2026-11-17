@@ -25,6 +25,21 @@ void VpcdReader::init(wchar_t *section) {
 	portBase=GetPrivateProfileInt(L"Driver",L"RPC_PORT_BASE",VPCDPORT,L"BixVReader.ini");
 
 	port=(short) GetPrivateProfileInt(section,L"TCP_PORT",portBase+instance,L"BixVReader.ini");
+
+	/* BACKEND_HOST: override the default localhost.
+	 * Precedence: [ReaderN] section > [Driver] section > empty (localhost).
+	 * Empty/absent value keeps the existing reversed-mode behaviour
+	 * (vicc_init(NULL, port) binds server_sock on localhost).
+	 */
+	backendHost[0] = '\0';
+	char sectionA[32];
+	sprintf(sectionA, "Reader%d", instance);
+	GetPrivateProfileStringA(sectionA, "BACKEND_HOST", NULL, backendHost,
+	                        sizeof(backendHost), "BixVReader.ini");
+	if (backendHost[0] == '\0') {
+		GetPrivateProfileStringA("Driver", "BACKEND_HOST", NULL, backendHost,
+		                        sizeof(backendHost), "BixVReader.ini");
+	}
 }
 
 bool VpcdReader::CheckATR() {
@@ -99,7 +114,11 @@ void VpcdReader::Power(DWORD code) {
 
 DWORD VpcdReader::startServer() {
 	breakSocket = false;
-	ctx = vicc_init(NULL, port);
+	/* Pass NULL (localhost) if BACKEND_HOST is empty; otherwise the configured
+	 * value.  vicc_init interprets non-NULL hostname as "connect actively in
+	 * normal mode" and NULL as "bind a server in reversed mode". */
+	const char *host = (backendHost[0] != '\0') ? backendHost : NULL;
+	ctx = vicc_init(host, port);
 	while (!breakSocket) {
 		CheckATR();
 		Sleep(1000);

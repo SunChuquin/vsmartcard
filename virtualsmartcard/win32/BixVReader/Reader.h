@@ -88,6 +88,7 @@ class VpcdReader : public Reader {
 public:
 	static int portBase;
 	short port;
+	char backendHost[256];   /* ANSI; NULL-terminated; empty => localhost */
 	void *ctx;
 	bool breakSocket;
 	bool cardPresent;

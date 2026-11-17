@@ -14,6 +14,33 @@ Enter-VsDevShell -VsInstallPath "$VS_PATH" -Arch $env:VCVARS_PLATFORM -HostArch 
 
 & msbuild "virtualsmartcard\win32\BixVReader.sln" "/p:Configuration=Release;Platform=$env:MSBUILD_PLATFORM;TestCertFile=$TestCertFile"
 
+# BixVReaderInstaller.sln (包含 MSI + 驱动 INF 打包) — 原 CI 漏了这步
+& msbuild "virtualsmartcard\win32\BixVReaderInstaller\BixVReaderInstaller.sln" "/p:Configuration=Release;Platform=$env:MSBUILD_PLATFORM;TestCertFile=$TestCertFile"
+
+# 把原始驱动文件（dll/inf/cat/cms）显式 move 到工作目录
+# 它们在 BixVReader 工程的 bin/<Config>/<Platform>/ 下
+$BixBinDir = "virtualsmartcard\win32\BixVReader\bin\Release\$env:MSBUILD_PLATFORM"
+Write-Host "[build] looking for driver artifacts under: $BixBinDir"
+if (Test-Path $BixBinDir) {
+    Get-ChildItem -Path $BixBinDir -Recurse -File | ForEach-Object {
+        Write-Host "  found: $($_.FullName)"
+        Move-Item -Force $_.FullName "."
+    }
+} else {
+    Write-Host "[build] WARNING: BixVReader bin dir not found: $BixBinDir"
+    # fallback: 尝试 Release / Debug 两个配置
+    foreach ($cfg in @("Release", "Debug")) {
+        $alt = "virtualsmartcard\win32\BixVReader\bin\$cfg\$env:MSBUILD_PLATFORM"
+        if (Test-Path $alt) {
+            Write-Host "[build] using fallback: $alt"
+            Get-ChildItem -Path $alt -Recurse -File | ForEach-Object {
+                Move-Item -Force $_.FullName "."
+            }
+            break
+        }
+    }
+}
+
 & python --version
 & python -m pip install -q --upgrade pip
 & python -m pip install -q virtualenv

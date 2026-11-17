@@ -115,24 +115,45 @@ static struct vicc_ctx *ctx[VICC_MAX_SLOTS];
 const char *hostname = NULL;
 static const char openport[] = "/dev/null";
 
+/* Returns the TCP port for the given slot.
+ *
+ * If the environment variable VPCD_SHARED_PORT is set to "1" (or any
+ * non-empty value), all slots connect to the single well-known VPCDPORT
+ * (default 35963).  This enables the "one card, many interfaces" model:
+ * the vpicc backend (run with --multi-interface --reversed) accepts
+ * multiple TCP connections, each representing a separate interface, and
+ * dispatches all APDUs to the *same* card OS, protected by a mutex that
+ * mimics the card's internal arbitrator.
+ *
+ * When VPCD_SHARED_PORT is *not* set, fall back to the original
+ * behaviour: each slot connects to Channel + slot (independent cards).
+ */
+static unsigned short get_port_for_slot(unsigned short channel, unsigned short slot)
+{
+    const char *env = getenv("VPCD_SHARED_PORT");
+    if (env && env[0] != '\0')
+        return VPCDPORT;
+    return (unsigned short)(channel + slot);
+}
+
 RESPONSECODE
 IFDHCreateChannel (DWORD Lun, DWORD Channel)
 {
     size_t slot = Lun & 0xffff;
+    unsigned short port;
     if (slot >= vicc_max_slots) {
         return IFD_COMMUNICATION_ERROR;
     }
+    port = get_port_for_slot((unsigned short)Channel, (unsigned short)slot);
     if (!hostname)
-        Log2(PCSC_LOG_INFO, "Waiting for virtual ICC on port %hu",
-                (unsigned short) (Channel+slot));
-    ctx[slot] = vicc_init(hostname, Channel+slot);
+        Log2(PCSC_LOG_INFO, "Waiting for virtual ICC on port %hu", port);
+    ctx[slot] = vicc_init(hostname, port);
     if (!ctx[slot]) {
         Log1(PCSC_LOG_ERROR, "Could not initialize connection to virtual ICC");
         return IFD_COMMUNICATION_ERROR;
     }
     if (hostname)
-        Log3(PCSC_LOG_INFO, "Connected to virtual ICC on %s port %hu",
-                hostname, (unsigned short) (Channel+slot));
+        Log3(PCSC_LOG_INFO, "Connected to virtual ICC on %s port %hu", hostname, port);
 
     return IFD_SUCCESS;
 }
